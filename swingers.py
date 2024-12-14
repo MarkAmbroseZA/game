@@ -1,22 +1,57 @@
 
-from machine import Pin, SPI
+from machine import Pin, SPI, PWM, idle
 from hashlib import sha1
-from ubinascii import hexlify
-from urequests2 import get
-from network import STA_IF, WLAN
-import gc
+#from ubinascii import hexlify
+#from urequests2 import get
+#from network import STA_IF, WLAN
+#import gc
+import time
+import neopixel
+import random
 from xpt2046 import Touch
 from ili9341 import Display, color565
 from xglcd_font import XglcdFont
-#from touch_keyboard import TouchKeyboard
 from time import sleep
 
+# Constants
+FLAG_LIMIT = 4  # Number of steps to reach the edge
+NUM_POSITIONS = 2 * FLAG_LIMIT + 1  # Total flag positions (9 for -4 to +4)
+LED_GROUP_SIZE = 3  # LEDs per flag position
+NUM_LEDS = NUM_POSITIONS * LED_GROUP_SIZE  # Total LEDs (27 for 9 positions)
+PRESS_DURATION_MS = 600  # Minimum press duration to score
+DISABLE_TIME_MS = 1000  # Time to disable scoring after a point
+MOVE_STEP = 1  # Movement per score
+WIN_FLASH_DURATION = 5  # Duration to flash LEDs on win in seconds
+CONSECUTIVE_HOOKS_LIMIT = 3  # Limit for consecutive hooks to win immediately
+
+#GPIO Pins for switches and LED strip
 spi1 = SPI(1, baudrate=51200000,sck=Pin(14), mosi=Pin(13), miso=Pin(12))
 spi2 = SPI(2, baudrate=1000000,sck=Pin(25), mosi=Pin(32), miso=Pin(39))
 bl_pin = Pin(21, Pin.OUT)  # Backlight pin setup (adjust pin as needed)
-bl_pin.on()                # Power on the backlight   
-  
-  
+PLAYER1_PIN = 22
+PLAYER2_PIN = 27
+SPEAKER_PIN = 26
+LED_PIN = 3  # This uses the rx pin  
+
+# Hardware setup for switches and speaker
+player1_switch = Pin(PLAYER1_PIN, Pin.IN, Pin.PULL_UP)
+player2_switch = Pin(PLAYER2_PIN, Pin.IN, Pin.PULL_UP)
+speaker = PWM(Pin(SPEAKER_PIN))
+led_strip = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), NUM_LEDS, timing=(350, 700, 800, 600))
+
+# Flag and game state variables
+flag_position = 0  # Start in the middle
+player1_disabled_until = 0
+player2_disabled_until = 0
+player1_press_start = None
+player2_press_start = None
+player1_scored = False
+player2_scored = False
+
+# Power on the backlight and turn off the speaker 
+bl_pin.on()               
+Pin(LED_PIN).off()
+speaker.duty_u16(0)
 
 class TouchKeyboard(object):
     """Touchscreen keyboard for ILI9341."""
@@ -180,65 +215,132 @@ class hooka(object):
 
         # Set up touchscreen
         self.xpt = Touch(spi2, cs=Pin(33), int_pin=Pin(36),int_handler=self.touchscreen_press)
-        self.wlan = WLAN(STA_IF)
+        #self.wlan = WLAN(STA_IF)
 
-    def lookup(self, pwd):
-        """Return the number of times password found in pwned database.
-        Args:
-            pwd: password to check
-        Returns:
-            integer: password hits from online pwned database.
-        Raises:
-            IOError: if there was an error due to WiFi network.
-            RuntimeError: if there was an error trying to fetch data from dB.
-            UnicodeError: if there was an error UTF_encoding the password.
-        """
-        sha1pwd = sha1(pwd.encode('utf-8')).digest()
-        sha1pwd = hexlify(sha1pwd).upper().decode('utf-8')
-        head, tail = sha1pwd[:5], sha1pwd[5:]
-
-        if not self.wlan.isconnected():
-            raise IOError('WiFi network error')
-
-        hits = 0
-        gc.collect()
-        with get('https://api.pwnedpasswords.com/range/' + head) as response:
-            for line in response.iter_lines():
-                l = line.decode(response.encoding).split(":")
-                if l[0] == tail:
-                    hits = int(l[1])
-                    break
-        gc.collect()
-
-        return hits
 
     def touchscreen_press(self, x, y):
         """Process touchscreen press events."""
-        if self.keyboard.handle_keypress(x, y, debug=True) is True:  # this only happens when the keyboard enter key is pressed
+        if self.keyboard.handle_keypress(x, y, debug=True) is True:
+            # this only happens when the keyboard enter key is pressed
             self.keyboard.locked = True                              # lock the keyboard and save the text .   
             pwd = self.keyboard.kb_text
-
-            self.keyboard.show_message("Searching...", color565(0, 0, 255))
-            try:
-                hits = self.lookup(pwd)
-
-                if hits:
-                    # Password found
-                    msg = "PASSWORD HITS: {0}".format(hits)
-                    self.keyboard.show_message(msg, color565(255, 0, 0))
-                else:
-                    # Password not found
-                    msg = "PASSWORD NOT FOUND"
-                    self.keyboard.show_message(msg, color565(0, 255, 0))
-            except Exception as e:
-                if hasattr(e, 'message'):
-                    self.keyboard.show_message(e.message[:22],color565(255, 255, 255))
-                else:
-                    self.keyboard.show_message(str(e)[:22],color565(255, 255, 255))
-
+ 
             self.keyboard.waiting = True
             self.keyboard.locked = False
 
+def play_winning_tune():
+    """Play a tune when a player wins."""
+    melody = [440, 494, 523, 587, 659, 698, 784]  # A4, B4, C5, D5, E5, F5, G5
+    for freq in melody:
+        speaker.freq(freq)
+        speaker.duty_u16(3000)  # Set duty cycle
+        time.sleep(0.15)
+    speaker.duty_u16(0)  # Turn off speaker
+
+
+# Play sounds
+def play_tune(player):
+    """Play a short tune to indicate movement of the flag."""
+    if player == 1:
+        melody = [262, 330, 392]  # C4, E4, G4 for Player 1
+    elif player == 2:
+        melody = [392, 330, 262]  # G4, E4, C4 for Player 2
+    for freq in melody:
+        speaker.freq(freq)
+        speaker.duty_u16(2000)  # Set duty cycle
+        time.sleep(0.1)
+    speaker.duty_u16(0)  # Turn off speaker
+
+def flash_leds_randomly_for_winner(player):
+    """Flash the winning player's side LEDs randomly."""
+    end_time = time.time() + WIN_FLASH_DURATION
+    while time.time() < end_time:
+        for i in range(NUM_LEDS):
+            if (player == 1 and i < NUM_LEDS // 2) or (player == 2 and i >= NUM_LEDS // 2):
+                led_strip[i] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+            else:
+                led_strip[i] = (0, 0, 0)
+        led_strip.write()
+        time.sleep(0.1)
+
+    # Clear LEDs after flashing
+    for i in range(NUM_LEDS):
+        led_strip[i] = (0, 0, 0)
+    led_strip.write()
+
+def display_flag():
+    """Display the flag's position on the LED strip."""
+    global flag_position
+
+    # Clear all LEDs
+    for i in range(NUM_LEDS):
+        led_strip[i] = (0, 0, 0)
+
+    # Calculate the group index for the current flag position
+    group_index = flag_position + FLAG_LIMIT  # Map flag_position to group index
+    group_start = group_index * LED_GROUP_SIZE
+    group_end = min(group_start + LED_GROUP_SIZE, NUM_LEDS)  # Ensure we don't go out of bounds
+
+    # Light up the LEDs in the current group
+    for i in range(group_start, group_end):
+        if flag_position == 0:
+            led_strip[i] = (0, 255, 0)  # Green for center
+        elif flag_position < 0:
+            led_strip[i] = (255, 0, 0)  # Yellow for Player 1's side
+        elif flag_position > 0:
+            led_strip[i] = (0, 0, 255)  # Blue for Player 2's side
+
+    # Write changes to the LED strip
+    led_strip.write()
+
+# Check if a player has won
+def check_winner():
+    """Check if the flag has moved past the limit."""
+    global flag_position
+
+    if flag_position == -FLAG_LIMIT - 1:
+        print("Player 1 wins!")
+        play_tune(1)
+        flash_leds_randomly_for_winner(1)
+        reset_game()
+    elif flag_position == FLAG_LIMIT + 1:
+        print("Player 2 wins!")
+        play_tune(2)
+        flash_leds_randomly_for_winner(2)
+        reset_game()
+
+def play_reset_tune():
+    """Play a special tune if a hook is switched on during reset."""
+    melody = [784, 698, 659, 587, 523, 494, 440]  # G5, F5, E5, D5, C5, B4, A4
+    for freq in melody:
+        speaker.freq(freq)
+        speaker.duty_u16(3000)  # Set duty cycle
+        time.sleep(0.1)
+    speaker.duty_u16(0)  # Turn off speaker
+
+def reset_game():
+    """Reset the game state."""
+    global flag_position, player1_consecutive_hooks, player2_consecutive_hooks
+
+    # Ensure switches are released before starting the game
+    print("Checking switches before starting...")
+    while player1_switch.value() == 0 or player2_switch.value() == 0:
+        if player1_switch.value() == 0:
+            print("Player 1 switch is active!")
+            flag_position = -4
+            display_flag()
+        if player2_switch.value() == 0:
+            print("Player 2 switch is active!")
+            flag_position = 4
+            display_flag()
+        play_reset_tune()  # Play warning tune
+        time.sleep(0.5)  # Pause briefly before checking again
+
+    print("All switches released. Game resetting...")
+    flag_position = 0  # Reset flag position to center
+    player1_consecutive_hooks = 0  # Reset Player 1's consecutive hooks
+    player2_consecutive_hooks = 0  # Reset Player 2's consecutive hooks
+    display_flag()  # Display the flag at the center
 
 def do_connect():
     import network
@@ -251,14 +353,83 @@ def do_connect():
             pass
     print('network config:', sta_if.ipconfig('addr4'))
 
-
 def main():
+    speaker.duty_u16(0)
     screen="splash"
-    do_connect()
-    hooka(spi1, spi2)
+    hooka(spi1, spi2)      #Start screen and Touch 
+    
+    
+    global flag_position
+    global player1_disabled_until, player2_disabled_until
+    global player1_press_start, player2_press_start
+    global player1_scored, player2_scored
+    global player1_consecutive_hooks, player2_consecutive_hooks
+
+    print("Game starting... Tug-of-War begins!")
+    reset_game()
 
     while True:
-        sleep(.1)
+        current_time = time.ticks_ms()
+
+        # Player 1: Handle button press
+        if player1_switch.value() == 0:  # Button pressed
+            if player1_press_start is None:
+                player1_press_start = current_time
+            elif not player1_scored and current_time >= player1_disabled_until:
+                press_duration = time.ticks_diff(current_time, player1_press_start)
+                if press_duration >= PRESS_DURATION_MS:
+                    flag_position -= MOVE_STEP
+                    player1_scored = True
+                    player1_consecutive_hooks += 1
+                    player2_consecutive_hooks = 0  # Reset Player 2's consecutive hooks
+                    print(f"Player 1 moved the flag! Position: {flag_position}")
+                    print(f"Player 1 consecutive hooks: {player1_consecutive_hooks}")
+                    play_tune(1)
+                    player1_disabled_until = current_time + DISABLE_TIME_MS
+                    display_flag()
+                    if player1_consecutive_hooks >= CONSECUTIVE_HOOKS_LIMIT:
+                        print("Player 1 wins by consecutive hooks!")
+                        play_winning_tune()
+                        flash_leds_randomly_for_winner(1)
+                        reset_game()
+                    check_winner()
+        else:  # Button released
+            if player1_press_start is not None and time.ticks_diff(current_time, player1_press_start) < PRESS_DURATION_MS:
+                print("Player 1 failed to press long enough. Consecutive hooks reset.")
+                player1_consecutive_hooks = 0  # Reset consecutive hooks on miss
+            player1_press_start = None
+            player1_scored = False
+
+        # Player 2: Handle button press
+        if player2_switch.value() == 0:  # Button pressed
+            if player2_press_start is None:
+                player2_press_start = current_time
+            elif not player2_scored and current_time >= player2_disabled_until:
+                press_duration = time.ticks_diff(current_time, player2_press_start)
+                if press_duration >= PRESS_DURATION_MS:
+                    flag_position += MOVE_STEP
+                    player2_scored = True
+                    player2_consecutive_hooks += 1
+                    player1_consecutive_hooks = 0  # Reset Player 1's consecutive hooks
+                    print(f"Player 2 moved the flag! Position: {flag_position}")
+                    print(f"Player 2 consecutive hooks: {player2_consecutive_hooks}")
+                    play_tune(2)
+                    player2_disabled_until = current_time + DISABLE_TIME_MS
+                    display_flag()
+                    if player2_consecutive_hooks >= CONSECUTIVE_HOOKS_LIMIT:
+                        print("Player 2 wins by consecutive hooks!")
+                        play_winning_tune()
+                        flash_leds_randomly_for_winner(2)
+                        reset_game()
+                    check_winner()
+        else:  # Button released
+            if player2_press_start is not None and time.ticks_diff(current_time, player2_press_start) < PRESS_DURATION_MS:
+                print("Player 2 failed to press long enough. Consecutive hooks reset.")
+                player2_consecutive_hooks = 0  # Reset consecutive hooks on miss
+            player2_press_start = None
+            player2_scored = False
+
+        time.sleep(0.01)  # Reduce CPU usage
 
 
 main()
